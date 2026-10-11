@@ -1,0 +1,6 @@
+.env
+questions.csv
+*.tmp
+__pycache__/
+# O banco de perguntas fica no Google Drive (questions.csv); o PDF tem o mesmo conteúdo
+AIP-C01_Practice_Questions_*.pdf
