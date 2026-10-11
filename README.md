@@ -32,11 +32,11 @@ Domínios e pesos: **1.** Foundation Model Integration, Data Management, and Com
 
 ## Desempenho e robustez
 
-- O banco de perguntas é validado ao carregar e fica **num único objeto compartilhado em memória** (`st.cache_resource`, TTL de 2 horas). Assim, não há cópia por usuário nem desserialização a cada clique.
+- O banco de perguntas é validado ao carregar e fica **num único objeto compartilhado em memória** (`st.cache_resource`, TTL de 24 horas, o mesmo do som). Assim, não há cópia por usuário nem desserialização a cada clique.
 - Cada sessão **congela o banco no início da prova**: se o cache do Drive renovar no meio, a prova em andamento não muda.
 - Download do Drive com sessão HTTP reaproveitada, **retry com backoff exponencial e jitter**, recusa da página HTML de aviso do Drive, **fallback** para o CSV local e um disjuntor que evita insistir no Drive por 5 minutos depois de uma falha.
 - Respostas guardadas como índices (estado de sessão compacto). Os callbacks são **idempotentes**: clique duplo não altera a resposta travada. O timer roda num fragmento, sem recarregar a página inteira.
-- O som é transmitido pelo navegador direto do repositório, via CDN (jsDelivr, com o GitHub como reserva), e não passa pelo websocket do Streamlit. Assim ele não pesa no servidor nem atrasa os cliques.
+- O som de fundo (`static/som.mp3`, afinação 432 Hz) vai **íntegro, sem recompressão**: o base64 do arquivo inteiro fica em cache na memória, junto com o banco de questões, e entra num `<audio autoplay loop>`. Como esse HTML não muda entre um clique e outro, o Streamlit envia o som uma única vez por sessão, e o navegador mantém a música tocando sem reiniciar.
 
 ## Pré-requisitos
 
@@ -102,7 +102,7 @@ As colunas opcionais podem ficar vazias, e um CSV antigo, só com as 4 primeiras
 streamlit run manage_questions.py
 ```
 
-Depois de editar o banco, faça upload do CSV para o Google Drive (ou use o CSV local) e rode o web app em ambiente local ou em produção. Obs.: o CSV do Drive é cacheado por 2 horas; recarregue (F5) para reiniciar o simulado.
+Depois de editar o banco, faça upload do CSV para o Google Drive (ou use o CSV local) e rode o web app em ambiente local ou em produção. Obs.: o CSV do Drive é cacheado por 24 horas (para aplicar um CSV novo antes disso, use *Reboot app* no painel do Streamlit); recarregue (F5) para reiniciar o simulado.
 
 Material não oficial, criado para estudo a partir do guia oficial do exame e da documentação da AWS.
 

@@ -1,3 +1,4 @@
+import base64
 import html
 import json
 import ast
@@ -11,7 +12,6 @@ from pathlib import Path
 import pandas as pd
 import requests
 import streamlit as st
-import streamlit.components.v1 as components
 from dotenv import load_dotenv
 
 # Carrega as variáveis do arquivo .env (no Streamlit Cloud, os Secrets viram variáveis de ambiente)
@@ -19,18 +19,11 @@ load_dotenv()
 GOOGLE_DRIVE_CSV_URL = os.getenv("GOOGLE_DRIVE_CSV_URL")
 BASE_DIR = Path(__file__).parent
 LOCAL_CSV = BASE_DIR / "questions.csv"
-# O som sai do repositório público por CDN (streaming, com cache), e não pelo websocket do Streamlit:
-# assim os ~3 MB não disputam o canal dos cliques nem pesam no servidor. GitHub raw é a reserva.
-# AUDIO_URL (opcional, no .env/Secrets) troca a fonte principal.
-AUDIO_SOURCES = [u for u in (
-    os.getenv("AUDIO_URL"),
-    "https://cdn.jsdelivr.net/gh/aryribeiro/aws-simulator5@main/static/som.mp3",
-    "https://raw.githubusercontent.com/aryribeiro/aws-simulator5/main/static/som.mp3",
-) if u]
+AUDIO_FILE = BASE_DIR / "static" / "som.mp3"  # som íntegro (432 Hz), sem recompressão
 
 EXAM_MINUTES = 180          # duração oficial do AIP-C01
 ESL_EXTRA_MINUTES = 30      # acomodação ESL +30 da AWS para quem não é nativo em inglês
-CACHE_TTL = 2 * 60 * 60     # 2 horas
+CACHE_TTL = 24 * 60 * 60    # 24 horas (questões do Drive e som)
 DRIVE_COOLDOWN = 5 * 60     # após falha do Drive, usa o CSV local por 5 min sem tentar de novo
 LETTERS = "ABCDEFGH"
 MODOS = {
@@ -274,6 +267,18 @@ def get_questions():
     )
 
 
+# Som de fundo, técnica do aws-ccp-game: o mp3 inteiro em base64 dentro de um <audio autoplay loop>.
+# O HTML fica em cache na memória (um único objeto para todas as sessões, junto com o banco de questões);
+# como ele é idêntico a cada rerun, o React mantém o mesmo elemento e a música não reinicia.
+@st.cache_resource(ttl=CACHE_TTL, show_spinner=False)
+def audio_html():
+    if not AUDIO_FILE.exists():
+        return ""
+    b64 = base64.b64encode(AUDIO_FILE.read_bytes()).decode()
+    return (f'<audio autoplay loop id="background-music">'
+            f'<source src="data:audio/mpeg;base64,{b64}" type="audio/mpeg"></audio>')
+
+
 # Durante a prova, a sessão usa o banco congelado no início: se o cache do Drive renovar no meio, nada muda.
 if "bank" in st.session_state:
     QUESTIONS = st.session_state.bank
@@ -342,6 +347,12 @@ if not st.session_state.finished:
         st.session_state.tempo_esgotado = True
     elif respondidas == TOTAL:
         st.session_state.finished = True
+
+# — Som de fundo —
+# Montado só depois do clique em "Iniciar" (o clique libera o autoplay) e sempre na mesma posição da página.
+# No fim do simulado o elemento deixa de ser renderizado e o navegador para o som; o F5 também.
+if not st.session_state.finished and audio_html():
+    st.markdown(audio_html(), unsafe_allow_html=True)
 
 
 # — Timer ou status —
@@ -483,51 +494,3 @@ st.markdown("""
     <small>obs.: recarregue (F5) para reiniciar o simulado.</small>
 </div>
 """, unsafe_allow_html=True)
-
-# — Som de fundo —
-# O <audio> é criado no documento da página (fora do iframe), então sobrevive aos reruns.
-# O componente só é renderizado no primeiro run após o início (idempotente por sessão).
-# Para no fim do simulado; o F5 recarrega a página e o som some junto.
-if not st.session_state.finished and not st.session_state.get("audio_enviado") and AUDIO_SOURCES:
-    st.session_state.audio_enviado = True
-    components.html(f"""<script>
-(function () {{
-  const doc = window.parent.document;
-  if (doc.getElementById("aip-bg-audio")) return;
-  const a = doc.createElement("audio");
-  a.id = "aip-bg-audio";
-  a.loop = true;
-  a.preload = "auto";
-  a.volume = 0.35;
-  // <source> em cadeia: se a CDN falhar, o navegador passa sozinho para a próxima fonte.
-  {json.dumps(AUDIO_SOURCES)}.forEach((url) => {{
-    const s = doc.createElement("source");
-    s.src = url;
-    s.type = "audio/mpeg";
-    a.appendChild(s);
-  }});
-  doc.body.appendChild(a);
-  // A lógica de tocar roda no realm da página: continua viva depois que este iframe sai da tela.
-  const s = doc.createElement("script");
-  s.textContent = `(function () {{
-    const a = document.getElementById("aip-bg-audio");
-    const evs = ["pointerdown", "keydown"];
-    const off = () => evs.forEach((ev) => document.removeEventListener(ev, tentar, true));
-    function tentar() {{ if (a.isConnected) a.play().then(off).catch(() => {{}}); else off(); }}
-    window.__aipAudioStop = () => {{ off(); a.pause(); a.replaceChildren(); a.load(); a.remove(); }};
-    evs.forEach((ev) => document.addEventListener(ev, tentar, true));
-    tentar();  // o clique em "Iniciar" já liberou o autoplay; se o navegador recusar, toca no próximo clique
-  }})();`;
-  doc.head.appendChild(s);
-}})();
-</script>""", height=0)
-elif st.session_state.finished and st.session_state.get("audio_enviado") and not st.session_state.get("audio_parado"):
-    st.session_state.audio_parado = True
-    components.html("""<script>
-(function () {
-  const w = window.parent;
-  if (w.__aipAudioStop) { w.__aipAudioStop(); return; }
-  const a = w.document.getElementById("aip-bg-audio");
-  if (a) { a.pause(); a.remove(); }
-})();
-</script>""", height=0)

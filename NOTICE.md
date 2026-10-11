@@ -7,6 +7,7 @@
 - Autor e titular dos direitos: **Ary Ribeiro**
 - Copyright (c) 2026 Ary Ribeiro
 - Repositório: https://github.com/aryribeiro/aws-simulator5
+- Em produção: https://aip-c01.streamlit.app/
 - LinkedIn: https://www.linkedin.com/in/aryribeiro
 - Licença: MIT (veja o arquivo `LICENSE`)
 
@@ -25,6 +26,7 @@ Este projeto foi criado por Ary Ribeiro e publicado como código aberto para aju
 - Author and copyright holder: **Ary Ribeiro**
 - Copyright (c) 2026 Ary Ribeiro
 - Repository: https://github.com/aryribeiro/aws-simulator5
+- Live: https://aip-c01.streamlit.app/
 - LinkedIn: https://www.linkedin.com/in/aryribeiro
 - License: MIT (see the file `LICENSE`)
 
@@ -43,6 +45,7 @@ This project was created by Ary Ribeiro and released as open source to help the 
 - Autor y titular de los derechos: **Ary Ribeiro**
 - Copyright (c) 2026 Ary Ribeiro
 - Repositorio: https://github.com/aryribeiro/aws-simulator5
+- En producción: https://aip-c01.streamlit.app/
 - LinkedIn: https://www.linkedin.com/in/aryribeiro
 - Licencia: MIT (vea el archivo `LICENSE`)
 
