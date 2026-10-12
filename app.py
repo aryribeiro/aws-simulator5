@@ -1,18 +1,15 @@
-import base64
 import html
-import json
-import ast
 import os
-import random
 import re
 import time
-from io import StringIO
 from pathlib import Path
 
 import pandas as pd
-import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from dotenv import load_dotenv
+
+import cache_simulado as cs
 
 # Carrega as variáveis do arquivo .env (no Streamlit Cloud, os Secrets viram variáveis de ambiente)
 load_dotenv()
@@ -23,9 +20,7 @@ AUDIO_FILE = BASE_DIR / "static" / "som.mp3"  # som íntegro (432 Hz), sem recom
 
 EXAM_MINUTES = 180          # duração oficial do AIP-C01
 ESL_EXTRA_MINUTES = 30      # acomodação ESL +30 da AWS para quem não é nativo em inglês
-CACHE_TTL = 24 * 60 * 60    # 24 horas (questões do Drive e som)
-DRIVE_COOLDOWN = 5 * 60     # após falha do Drive, usa o CSV local por 5 min sem tentar de novo
-LETTERS = "ABCDEFGH"
+LETTERS = cs.LETTERS
 MODOS = {
     f"⏱️ Com tempo ({EXAM_MINUTES} minutos, como no exame real)": EXAM_MINUTES * 60,
     f"🌎 Com tempo + {ESL_EXTRA_MINUTES} min de acomodação ESL "
@@ -139,155 +134,130 @@ st.markdown("""
         line-height: 1.7;
     }
     .rodape a { text-decoration: none; color: inherit; }
+    /* Blocos invisíveis (ponte de cache e timer fixo) saem do fluxo: sem faixa vazia entre os elementos */
+    div[data-testid="stElementContainer"]:has(iframe[title*="cache_bridge"]),
+    div[data-testid="stElementContainer"]:has(.timer-box) {
+        position: absolute !important;
+        width: 0 !important;
+        height: 0 !important;
+        overflow: visible;
+    }
+    iframe[title*="cache_bridge"] { width: 0 !important; height: 0 !important; border: 0; }
+    /* Carregando as perguntas (primeiro acesso com o servidor frio) */
+    @keyframes simgira { to { transform: rotate(360deg); } }
+    .carregando { display: flex; align-items: center; gap: 10px; color: #31333f; margin: 1rem 0; }
+    .carregando i {
+        width: 22px; height: 22px; display: inline-block; border-radius: 50%;
+        border: 3px solid #d0d4dc; border-top-color: #ff4b4b; animation: simgira .8s linear infinite;
+    }
+    /* Celular: o timer vira uma faixa fina no topo (não cobre o texto) e o fim da página ganha respiro
+       para os ícones do Streamlit Cloud (canto inferior direito) não taparem o último conteúdo */
+    @media (max-width: 640px) {
+        .block-container { padding-top: 2.6rem; padding-bottom: 7rem; }
+        .timer-box {
+            top: 0; left: 0; right: 0;
+            text-align: center;
+            font-size: 15px;
+            padding: 5px 8px;
+            border-width: 0 0 1px 0;
+            border-radius: 0;
+            background: #ffffff;
+            box-shadow: 0 1px 4px rgba(0, 0, 0, 0.06);
+        }
+    }
 </style>
 """, unsafe_allow_html=True)
 
 
-# — Carrega perguntas —
-def parse_list(cell):
-    """Lê a célula como JSON; aceita também o formato legado (repr Python)."""
-    try:
-        return json.loads(cell)
-    except (json.JSONDecodeError, TypeError):
-        return ast.literal_eval(cell)
+# — Caches —
+# Servidor: dois caches independentes na RAM (CSV leve e MP3 pesado), carregados em paralelo, TTL de 24 h.
+# Dispositivo: IndexedDB do navegador (cache_bridge/index.html), também com TTL de 24 h.
+# Ordem do CSV: dispositivo -> RAM do servidor -> Google Drive (-> CSV local). MP3: dispositivo -> RAM -> arquivo.
+CSV_CACHE, MP3_CACHE = cs.caches(GOOGLE_DRIVE_CSV_URL, LOCAL_CSV, AUDIO_FILE)
+DEVICE_GRACE = 3.0  # segundos que o servidor espera o relatório do dispositivo antes de seguir sem ele
+_ponte = components.declare_component("cache_bridge", path=str(BASE_DIR / "cache_bridge"))
+
+csv_futuro = CSV_CACHE.future()   # não bloqueia: dispara a carga do CSV se a RAM estiver vazia
+MP3_CACHE.future()                # e, em paralelo, a do MP3 (só a RAM do servidor; o aluno recebe depois)
+st.session_state.setdefault("t_abertura", time.time())
 
 
-def parse_optional(cell, default):
-    """Colunas novas (explicação, motivos, referência) são opcionais: célula vazia ou ausente vira default."""
-    if not isinstance(cell, str) or not cell.strip():
-        return default
-    try:
-        return parse_list(cell)
-    except (ValueError, SyntaxError):
-        return cell.strip()  # texto simples também vale
+def dispositivo():
+    return st.session_state.get("cache_bridge") or {}
 
 
-def as_tuple(value):
-    if isinstance(value, str):
-        return (value,) if value else ()
-    return tuple(str(v) for v in value)
+def resolver_banco():
+    """Banco desta sessão + de onde veio. (None, None) enquanto ainda espera o dispositivo ou o Drive."""
+    if "bank" in st.session_state:
+        return st.session_state.bank, st.session_state.fonte
+    dev = dispositivo()
+    srv = CSV_CACHE.peek()
+    dcsv = dev.get("csv") or {}
+    # 1ª camada: a cópia do dispositivo (24 h). Se o servidor tem a MESMA versão, usa o objeto já na RAM
+    # (zero cópia); se o servidor está frio, valida a cópia do aluno e serve só a esta sessão.
+    if dcsv.get("version") and (srv is None or dcsv["version"] == srv.version):
+        if srv is not None:
+            return srv.value["bank"], "dispositivo"
+        banco = cs.bank_from_device(dcsv.get("text"))
+        if banco:
+            return banco, "dispositivo"
+    # 2ª camada: a RAM do servidor (se a versão do dispositivo for outra, a do servidor é a mais nova).
+    # Se a RAM foi preenchida durante esta visita, a origem real foi o Drive (ou o CSV local).
+    if srv is not None:
+        if srv.loaded_at >= st.session_state.t_abertura:
+            return srv.value["bank"], ("drive" if srv.source == "drive" else "csv local")
+        return srv.value["bank"], "servidor"
+    if not dev.get("reported") and time.time() - st.session_state.t_abertura < DEVICE_GRACE:
+        return None, None
+    # 3ª camada: Google Drive (com retry/backoff/disjuntor e, por último, o CSV local)
+    if not csv_futuro.done():
+        return None, None
+    entrada = csv_futuro.result()  # se a carga falhou, a exceção sobe e vira a mensagem de erro abaixo
+    return entrada.value["bank"], ("drive" if entrada.source == "drive" else "csv local")
 
 
-def parse_questions(df):
-    """Valida o banco inteiro e devolve uma estrutura imutável (compartilhada entre sessões)."""
-    faltando = {"question", "options", "answer", "multiple"} - set(df.columns)
-    if faltando:
-        raise ValueError(f"CSV sem as colunas obrigatórias: {sorted(faltando)}")
-    qs = []
-    for n, r in enumerate(df.to_dict("records"), start=1):
-        opts = tuple(parse_list(r["options"]))
-        ans_txt = parse_list(r["answer"])
-        if not opts or len(set(opts)) != len(opts) or len(opts) > len(LETTERS):
-            raise ValueError(f"Linha {n}: alternativas vazias, repetidas ou acima de {len(LETTERS)}.")
-        if not ans_txt or not set(ans_txt) <= set(opts):
-            raise ValueError(f"Linha {n}: resposta correta fora das alternativas.")
-        mul = str(r["multiple"]).strip().lower() == "true"
-        if not mul and len(set(ans_txt)) > 1:
-            raise ValueError(f"Linha {n}: mais de uma correta exige multiple=True.")
-        wrong = parse_optional(r.get("wrong"), {})
-        qs.append({
-            "q": str(r["question"]).strip(),
-            "opts": opts,
-            "ans": frozenset(opts.index(a) for a in ans_txt),   # índices: estado compacto
-            "mul": mul,
-            "exp": as_tuple(parse_optional(r.get("explanation"), ())),
-            "why": {opts.index(k): str(v) for k, v in (wrong.items() if isinstance(wrong, dict) else ())
-                    if k in opts},
-            "refs": as_tuple(parse_optional(r.get("reference"), ())),
-            "tag": str(r.get("domain") or "").strip(),
-        })
-    if not qs:
-        raise ValueError("O CSV não tem perguntas.")
-    return tuple(qs)
-
-
-def read_csv_text(text):
-    # keep_default_na=False: alternativas como "None" ou "NA" não podem virar NaN
-    return pd.read_csv(StringIO(text), dtype=str, keep_default_na=False)
-
-
-@st.cache_resource(show_spinner=False)
-def http_session():
-    """Uma sessão HTTP reaproveitada (pool de conexões) para todo o servidor."""
-    s = requests.Session()
-    s.headers["User-Agent"] = "aws-simulator5"
-    return s
-
-
-@st.cache_resource(show_spinner=False)
-def drive_breaker():
-    """Disjuntor simples: guarda até quando o Drive deve ser evitado após falhar."""
-    return {"open_until": 0.0}
-
-
-def fetch_csv(url, attempts=3, base_delay=0.5):
-    """Baixa o CSV com retry, backoff exponencial e jitter. Recusa HTML (página de aviso/permissão do Drive)."""
-    last = None
-    for n in range(attempts):
+def args_ponte(fase, total):
+    dev = dispositivo()
+    srv = CSV_CACHE.peek()
+    csv_arg = {"version": srv.version if srv else None, "text": None}
+    # Depois que a RAM do servidor tem o CSV, ele vai para o dispositivo (uma vez por versão)
+    if srv is not None and dev.get("reported") and dev.get("idb") and dev.get("csv_have") != srv.version:
+        csv_arg["text"] = srv.value["text"]
+    mp3_arg = {"version": None, "b64": None}
+    if fase == "exam":
         try:
-            resp = http_session().get(url, timeout=(5, 20))
-            resp.raise_for_status()
-            resp.encoding = "utf-8"  # Drive envia sem charset; evita mojibake
-            text = resp.text
-            if text.lstrip()[:1] == "<":
-                raise ValueError("o Drive devolveu uma página HTML, não o CSV (confira o compartilhamento do link)")
-            return text
-        except (requests.RequestException, ValueError) as e:
-            last = e
-            if n < attempts - 1:
-                time.sleep(base_delay * 2 ** n + random.uniform(0, base_delay))
-    raise last
-
-
-# cache_resource devolve o MESMO objeto a todas as sessões (sem cópia/unpickle a cada rerun).
-# O banco é imutável (tuplas/frozensets), então compartilhar é seguro. Exceções não são cacheadas.
-@st.cache_resource(ttl=CACHE_TTL, show_spinner=False)
-def load_remote(url):
-    return parse_questions(read_csv_text(fetch_csv(url)))
-
-
-@st.cache_resource(ttl=CACHE_TTL, show_spinner=False)
-def load_local(mtime):  # mtime na chave: editar o CSV local invalida o cache
-    return parse_questions(read_csv_text(LOCAL_CSV.read_text(encoding="utf-8")))
-
-
-def get_questions():
-    breaker = drive_breaker()
-    if GOOGLE_DRIVE_CSV_URL and time.time() >= breaker["open_until"]:
-        try:
-            return load_remote(GOOGLE_DRIVE_CSV_URL)
+            m = MP3_CACHE.get(timeout=30)
+            mp3_arg["version"] = m.version
+            # Só quando o dispositivo pede (já com a prova na tela) e não tem esta versão: lazy loading
+            if dev.get("mp3_need") and dev.get("mp3_have") != m.version:
+                mp3_arg["b64"] = m.value["b64"]
         except Exception:
-            breaker["open_until"] = time.time() + DRIVE_COOLDOWN
-            if not LOCAL_CSV.exists():
-                raise
-    if LOCAL_CSV.exists():
-        return load_local(LOCAL_CSV.stat().st_mtime)
-    raise RuntimeError(
-        "Defina GOOGLE_DRIVE_CSV_URL no arquivo .env ou coloque um questions.csv na pasta do app."
-    )
+            pass  # sem som não impede a prova
+    return {"phase": fase, "total": total, "ttl_ms": int(cs.TTL * 1000), "csv": csv_arg, "mp3": mp3_arg}
 
 
-# Som de fundo, técnica do aws-ccp-game: o mp3 inteiro em base64 dentro de um <audio autoplay loop>.
-# O HTML fica em cache na memória (um único objeto para todas as sessões, junto com o banco de questões);
-# como ele é idêntico a cada rerun, o React mantém o mesmo elemento e a música não reinicia.
-@st.cache_resource(ttl=CACHE_TTL, show_spinner=False)
-def audio_html():
-    if not AUDIO_FILE.exists():
-        return ""
-    b64 = base64.b64encode(AUDIO_FILE.read_bytes()).decode()
-    return (f'<audio autoplay loop id="background-music">'
-            f'<source src="data:audio/mpeg;base64,{b64}" type="audio/mpeg"></audio>')
+try:
+    QUESTIONS, FONTE = resolver_banco()
+except Exception as e:
+    st.error(f"Erro ao carregar as perguntas: {e}")
+    st.stop()
 
+if QUESTIONS is None:
+    # Primeiro acesso com o servidor frio: aguarda o dispositivo ou o Drive sem travar a tela
+    _ponte(**args_ponte("loading", 0), key="cache_bridge", default=None)
+    st.markdown('<div class="carregando"><i></i><span>Carregando as perguntas…</span></div>', unsafe_allow_html=True)
 
-# Durante a prova, a sessão usa o banco congelado no início: se o cache do Drive renovar no meio, nada muda.
-if "bank" in st.session_state:
-    QUESTIONS = st.session_state.bank
-else:
-    try:
-        QUESTIONS = get_questions()
-    except Exception as e:
-        st.error(f"Erro ao carregar as perguntas: {e}")
-        st.stop()
+    @st.fragment(run_every=0.4)
+    def aguardar_banco():
+        try:
+            pronto = resolver_banco()[0] is not None
+        except Exception:
+            pronto = True  # deixa o run completo mostrar o erro
+        if pronto:
+            st.rerun(scope="app")
+
+    aguardar_banco()
+    st.stop()
 
 TOTAL = len(QUESTIONS)
 
@@ -295,7 +265,9 @@ TOTAL = len(QUESTIONS)
 def start_simulado():
     if st.session_state.get("started"):
         return
+    # A sessão congela o banco no início: se o cache renovar no meio da prova, nada muda para o aluno
     st.session_state.bank = QUESTIONS
+    st.session_state.fonte = FONTE
     st.session_state.duration = MODOS[st.session_state.modo_sel]
     st.session_state.start_ts = time.time()
     st.session_state.finished = False
@@ -322,6 +294,25 @@ def lock_multiple(i, n_opts):
 st.session_state.setdefault("started", False)
 st.session_state.setdefault("finished", False)
 
+
+# — Encerramento automático (antes da ponte, para o som parar no mesmo run em que a prova acaba) —
+def tempo_restante():
+    return max(0, int(st.session_state.duration - (time.time() - st.session_state.start_ts)))
+
+
+respondidas = sum(1 for i in range(TOTAL) if f"resp_{i}" in st.session_state)
+
+if st.session_state.started and not st.session_state.finished:
+    if st.session_state.duration and tempo_restante() <= 0:
+        st.session_state.finished = True
+        st.session_state.tempo_esgotado = True
+    elif respondidas == TOTAL:
+        st.session_state.finished = True
+
+# — Ponte com o dispositivo (sempre nesta mesma posição da página: o iframe nunca remonta) —
+FASE = "start" if not st.session_state.started else ("done" if st.session_state.finished else "exam")
+_ponte(**args_ponte(FASE, TOTAL), key="cache_bridge", default=None)
+
 # — Tela inicial —
 if not st.session_state.started:
     st.markdown(
@@ -331,28 +322,10 @@ if not st.session_state.started:
     )
     st.radio("Modo do simulado:", list(MODOS), key="modo_sel")
     st.button("Iniciar Simulado", on_click=start_simulado)
+    ORIGENS = {"dispositivo": "do cache do seu dispositivo", "servidor": "do cache do servidor",
+               "drive": "do Google Drive", "csv local": "do CSV local"}
+    st.caption(f"⚡ Perguntas carregadas {ORIGENS.get(FONTE, '')}.")
     st.stop()
-
-
-# — Encerramento automático —
-def tempo_restante():
-    return max(0, int(st.session_state.duration - (time.time() - st.session_state.start_ts)))
-
-
-respondidas = sum(1 for i in range(TOTAL) if f"resp_{i}" in st.session_state)
-
-if not st.session_state.finished:
-    if st.session_state.duration and tempo_restante() <= 0:
-        st.session_state.finished = True
-        st.session_state.tempo_esgotado = True
-    elif respondidas == TOTAL:
-        st.session_state.finished = True
-
-# — Som de fundo —
-# Montado só depois do clique em "Iniciar" (o clique libera o autoplay) e sempre na mesma posição da página.
-# No fim do simulado o elemento deixa de ser renderizado e o navegador para o som; o F5 também.
-if not st.session_state.finished and audio_html():
-    st.markdown(audio_html(), unsafe_allow_html=True)
 
 
 # — Timer ou status —

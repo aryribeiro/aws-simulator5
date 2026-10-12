@@ -1,0 +1,196 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"></head>
+<body style="margin:0">
+<script>
+/*
+ * Ponte entre o navegador e o Python (protocolo oficial de componente do Streamlit, via postMessage).
+ *
+ * Cache do DISPOSITIVO (IndexedDB, TTL de 24 h, controlado por versão = hash do conteúdo):
+ *   - CSV: guardado depois que o servidor tem o banco na RAM; na próxima visita é oferecido ao servidor primeiro.
+ *   - MP3: o arquivo íntegro, byte a byte. Só é pedido DEPOIS que as perguntas estão todas na tela (lazy loading).
+ * Fallback: dispositivo -> RAM do servidor -> Google Drive (CSV) / arquivo do repositório (MP3).
+ *
+ * Também cuida do spinner do botão "Iniciar Simulado", do play no primeiro toque (iPhone/Safari) e de parar o som no fim.
+ */
+(function () {
+  var P = window.parent, D = P.document;
+  var DB_NAME = "aip-c01-simulador", STORE = "arquivos";
+  var args = null, iniciado = false, db = null;
+  var estado = { reported: false, idb: false, csv: null, csv_have: null, mp3_have: null, mp3_need: false, mp3_src: null };
+  var ultimoEnvio = "", seq = 0, audioIniciado = false, aguardandoTela = false, mp3EmCurso = false;
+
+  // ---------- protocolo do Streamlit
+  function post(msg) { msg.isStreamlitMessage = true; P.postMessage(msg, "*"); }
+  function enviar() {
+    var corpo = JSON.stringify(estado);
+    if (corpo === ultimoEnvio) return;           // idempotente: só avisa o Python quando algo mudou
+    ultimoEnvio = corpo;
+    var v = JSON.parse(corpo); v.seq = ++seq;
+    post({ type: "streamlit:setComponentValue", dataType: "json", value: v });
+  }
+  window.addEventListener("message", function (e) {
+    if (!e.data || e.data.type !== "streamlit:render") return;
+    args = e.data.args || {};
+    if (!iniciado) { iniciado = true; iniciar(); } else { aplicar(); }
+  });
+  post({ type: "streamlit:componentReady", apiVersion: 1 });
+  post({ type: "streamlit:setFrameHeight", height: 0 });
+
+  // ---------- IndexedDB (falha silenciosa: aba anônima, armazenamento bloqueado -> segue sem cache local)
+  function abrirDB() {
+    return new Promise(function (ok) {
+      try {
+        var r = indexedDB.open(DB_NAME, 1);
+        r.onupgradeneeded = function () { r.result.createObjectStore(STORE, { keyPath: "k" }); };
+        r.onsuccess = function () { ok(r.result); };
+        r.onerror = r.onblocked = function () { ok(null); };
+      } catch (e) { ok(null); }
+    });
+  }
+  function ler(k) {
+    return new Promise(function (ok) {
+      if (!db) return ok(null);
+      try { var r = db.transaction(STORE).objectStore(STORE).get(k); r.onsuccess = function () { ok(r.result || null); }; r.onerror = function () { ok(null); }; }
+      catch (e) { ok(null); }
+    });
+  }
+  function gravar(reg) {
+    return new Promise(function (ok) {
+      if (!db) return ok(false);
+      try { var t = db.transaction(STORE, "readwrite"); t.objectStore(STORE).put(reg); t.oncomplete = function () { ok(true); }; t.onerror = t.onabort = function () { ok(false); }; }
+      catch (e) { ok(false); }
+    });
+  }
+  function apagar(k) {
+    try { if (db) db.transaction(STORE, "readwrite").objectStore(STORE).delete(k); } catch (e) {}
+  }
+  function valido(reg) { return reg && reg.saved_at && (Date.now() - reg.saved_at) < (args.ttl_ms || 86400000); }
+
+  async function iniciar() {
+    db = await abrirDB();
+    estado.idb = !!db;
+    var csv = await ler("csv"), mp3 = await ler("mp3");
+    if (csv && !valido(csv)) { apagar("csv"); csv = null; }      // TTL de 24 h vencido: descarta
+    if (mp3 && !valido(mp3)) { apagar("mp3"); mp3 = null; }
+    if (csv) { estado.csv = { version: csv.version, text: csv.text }; estado.csv_have = csv.version; }
+    if (mp3) { estado.mp3_have = mp3.version; }
+    estado.reported = true;
+    enviar();
+    aplicar();
+  }
+
+  async function aplicar() {
+    if (!estado.reported) return;
+    var fase = args.phase;
+    // O servidor mandou o CSV para guardar (o dispositivo não tinha, ou tinha uma versão antiga)
+    var c = args.csv || {};
+    if (c.text && c.version && estado.csv_have !== c.version) {
+      var ok = await gravar({ k: "csv", version: c.version, text: c.text, saved_at: Date.now() });
+      if (ok) { estado.csv_have = c.version; }
+    }
+    if (fase === "exam" || fase === "done") { estado.csv = null; }   // o texto só serve antes de começar
+    if (fase === "start") { ganchoSpinner(); }
+    if (fase === "exam") { await somDaProva(); }
+    if (fase === "done") { pararSom(); }
+    enviar();
+  }
+
+  // ---------- som: lazy loading, só depois que a prova inteira está na tela
+  function telaPronta() {
+    var total = args.total || 0;
+    return D.body.innerText.indexOf("Pergunta " + total + " de " + total) !== -1 &&
+           !D.querySelector('[data-testid="stStatusWidget"]');
+  }
+  async function somDaProva() {
+    if (audioIniciado || mp3EmCurso) return;
+    var m = args.mp3 || {};
+    if (!m.version) return;                                   // servidor sem som: nada a tocar
+    if (m.b64) {                                              // 2ª camada: veio da RAM do servidor
+      mp3EmCurso = true;
+      try {
+        var buf = await (await fetch("data:audio/mpeg;base64," + m.b64)).arrayBuffer();
+        if (await gravar({ k: "mp3", version: m.version, blob: new Blob([buf], { type: "audio/mpeg" }), size: buf.byteLength, saved_at: Date.now() })) {
+          estado.mp3_have = m.version;
+        }
+        estado.mp3_need = false; estado.mp3_src = "servidor";
+        tocar(buf);
+      } finally { mp3EmCurso = false; }
+      return;
+    }
+    if (aguardandoTela) return;
+    aguardandoTela = true;
+    (function esperar() {
+      if (!telaPronta()) { setTimeout(esperar, 250); return; }
+      setTimeout(async function () {                           // folga para o navegador pintar a tela
+        aguardandoTela = false;
+        if (audioIniciado) return;
+        var reg = await ler("mp3");                            // 1ª camada: cache do dispositivo
+        if (reg && valido(reg) && reg.version === (args.mp3 || {}).version && reg.blob) {
+          estado.mp3_src = "dispositivo";
+          tocar(await reg.blob.arrayBuffer());
+          enviar();
+        } else {
+          estado.mp3_need = true;                              // pede ao servidor (rerun leve; o som vem em seguida)
+          enviar();
+        }
+      }, 300);
+    })();
+  }
+
+  function tocar(buf) {
+    if (audioIniciado || D.getElementById("background-music")) return;
+    audioIniciado = true;
+    // Blob e URL criados no documento da página: o som não depende deste iframe para continuar tocando
+    var url = P.URL.createObjectURL(new P.Blob([buf], { type: "audio/mpeg" }));
+    var a = D.createElement("audio");
+    a.id = "background-music"; a.loop = true; a.src = url; a.dataset.url = url;
+    D.body.appendChild(a);
+    var s = D.createElement("script");
+    s.textContent = "(function(){var a=document.getElementById('background-music');var evs=['pointerdown','keydown','touchend'];" +
+      "function off(){evs.forEach(function(e){document.removeEventListener(e,tentar,true);});}" +
+      "function tentar(){if(!a.isConnected){off();return;}if(a.paused){a.play().then(off).catch(function(){});}else{off();}}" +
+      // Safari/iPhone só libera som dentro de um toque: se o autoplay for recusado, toca no próximo toque do aluno
+      "window.__simAudioStop=function(){off();a.pause();try{URL.revokeObjectURL(a.dataset.url);}catch(e){}a.removeAttribute('src');a.load();a.remove();};" +
+      "evs.forEach(function(e){document.addEventListener(e,tentar,true);});tentar();})();";
+    D.head.appendChild(s);
+  }
+
+  function pararSom() {
+    if (P.__simAudioStop) { P.__simAudioStop(); P.__simAudioStop = null; }
+    var a = D.getElementById("background-music");
+    if (a) { a.pause(); a.remove(); }
+  }
+
+  // ---------- spinner ao lado do botão "Iniciar Simulado"
+  var spinnerArmado = false;
+  function ganchoSpinner() {
+    if (spinnerArmado) return;
+    spinnerArmado = true;
+    if (!D.getElementById("sim-spin-css")) {
+      var st = D.createElement("style"); st.id = "sim-spin-css";
+      st.textContent = "@keyframes simgira{to{transform:rotate(360deg)}}" +
+        "#sim-spin{position:fixed;z-index:10000;display:flex;align-items:center;gap:10px;font:500 0.95rem 'Source Sans Pro',sans-serif;color:#31333f;pointer-events:none}" +
+        "#sim-spin i{width:22px;height:22px;border:3px solid #d0d4dc;border-top-color:#ff4b4b;border-radius:50%;animation:simgira .8s linear infinite;display:inline-block}";
+      D.head.appendChild(st);
+    }
+    D.addEventListener("click", function (e) {
+      var b = e.target && e.target.closest && e.target.closest("button");
+      if (!b || b.innerText.indexOf("Iniciar Simulado") === -1 || D.getElementById("sim-spin")) return;
+      var r = b.getBoundingClientRect();
+      var sp = D.createElement("div"); sp.id = "sim-spin";
+      sp.innerHTML = "<i></i><span>Carregando o simulado…</span>";
+      sp.style.left = (r.right + 14) + "px"; sp.style.top = (r.top + r.height / 2 - 11) + "px";
+      D.body.appendChild(sp);
+      var t0 = Date.now();
+      (function vigiar() {                                   // some quando a tela da prova substitui o botão
+        var aindaLa = [].some.call(D.querySelectorAll("button"), function (x) { return x.innerText.indexOf("Iniciar Simulado") !== -1; });
+        if (!aindaLa || Date.now() - t0 > 120000) { sp.remove(); return; }
+        setTimeout(vigiar, 150);
+      })();
+    }, true);
+  }
+})();
+</script>
+</body>
+</html>

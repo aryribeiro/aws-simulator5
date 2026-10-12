@@ -24,19 +24,36 @@ Domínios e pesos: **1.** Foundation Model Integration, Data Management, and Com
 - Perguntas de escolha única e de múltipla escolha com **2 ou 3 respostas** ("Select TWO" / "Select THREE"). Na múltipla, o botão de confirmar só libera com a quantidade exata marcada, e só vale ponto quem acerta todas.
 - Ao responder, aparece logo abaixo a **resposta correta com a explicação, em verde**, e **uma linha com o motivo de cada alternativa incorreta, em vermelho**, além do link da documentação oficial.
 - Três modos: 180 minutos (como no exame real), 210 minutos (com a acomodação ESL) ou sem limite de tempo.
-- Timer atualizado a cada segundo, fixo no canto superior direito.
-- Som de fundo em loop, que começa ao clicar em "Iniciar Simulado" e para quando o simulado termina (ou ao recarregar a página com F5).
+- Timer atualizado a cada segundo: fixo no canto superior direito no computador e numa faixa fina no topo do celular, sem cobrir o texto.
+- Spinner "Carregando o simulado…" ao lado do botão de iniciar, para ninguém achar que travou.
+- Som de fundo em loop (afinação 432 Hz, arquivo íntegro), que entra depois que a prova está na tela e para quando o simulado termina (ou ao recarregar a página com F5). No iPhone, se o Safari bloquear o início automático, o som começa no primeiro toque na tela.
 - Barra de progresso, nota final em percentual e **desempenho por domínio**.
 - Encerramento automático ao responder tudo ou ao esgotar o tempo.
-- Visual limpo e focado, com os elementos padrão do Streamlit ocultos via CSS. Uso sugerido em computador.
+- Visual limpo e focado, com os elementos padrão do Streamlit ocultos via CSS. Funciona no computador e no celular.
 
 ## Desempenho e robustez
 
-- O banco de perguntas é validado ao carregar e fica **num único objeto compartilhado em memória** (`st.cache_resource`, TTL de 24 horas, o mesmo do som). Assim, não há cópia por usuário nem desserialização a cada clique.
-- Cada sessão **congela o banco no início da prova**: se o cache do Drive renovar no meio, a prova em andamento não muda.
-- Download do Drive com sessão HTTP reaproveitada, **retry com backoff exponencial e jitter**, recusa da página HTML de aviso do Drive, **fallback** para o CSV local e um disjuntor que evita insistir no Drive por 5 minutos depois de uma falha.
+**Dois caches na RAM do servidor**, independentes e carregados em paralelo, com TTL de 24 horas (`cache_simulado.py`):
+
+| Cache | Conteúdo | Origem |
+|---|---|---|
+| CSV (leve) | banco de perguntas já validado | Google Drive → CSV local |
+| MP3 (pesado) | `static/som.mp3` **íntegro**, em base64 | arquivo do repositório |
+
+Cada um tem o seu lock e carrega uma única vez, mesmo com muitos alunos chegando juntos. Os dois ficam num único objeto por servidor, sem cópia por usuário.
+
+**Cache no dispositivo do aluno** (IndexedDB do navegador, `cache_bridge/index.html`), também com TTL de 24 horas e controle de versão por hash do conteúdo. Depois que os caches do servidor estão prontos, o CSV e o MP3 são gravados no aparelho. Na próxima visita, a ordem é:
+
+- **Perguntas:** cache do dispositivo → cache do servidor → Google Drive (→ CSV local).
+- **Som:** cache do dispositivo → cache do servidor → arquivo do repositório.
+
+Se o Drive tiver uma versão mais nova do CSV, o servidor percebe pela versão e atualiza o aparelho. Quando o servidor reinicia, quem já visitou o simulado não espera o Drive. Se o navegador não permitir armazenamento (aba anônima, por exemplo), o app segue normalmente pelo servidor.
+
+**Lazy loading do som:** o MP3 só é pedido depois que as 75 perguntas estão na tela. Assim, a prova aparece primeiro e o som chega em seguida (do aparelho, quando já está guardado, sem baixar nada).
+
+- Cada sessão **congela o banco no início da prova**: se o cache renovar no meio, a prova em andamento não muda.
+- Download do Drive com **retry, backoff exponencial e jitter**, recusa da página HTML de aviso do Drive, **fallback** para o CSV local e um disjuntor que evita insistir no Drive por 5 minutos depois de uma falha.
 - Respostas guardadas como índices (estado de sessão compacto). Os callbacks são **idempotentes**: clique duplo não altera a resposta travada. O timer roda num fragmento, sem recarregar a página inteira.
-- O som de fundo (`static/som.mp3`, afinação 432 Hz) vai **íntegro, sem recompressão**: o base64 do arquivo inteiro fica em cache na memória, junto com o banco de questões, e entra num `<audio autoplay loop>`. Como esse HTML não muda entre um clique e outro, o Streamlit envia o som uma única vez por sessão, e o navegador mantém a música tocando sem reiniciar.
 
 ## Pré-requisitos
 
@@ -102,7 +119,7 @@ As colunas opcionais podem ficar vazias, e um CSV antigo, só com as 4 primeiras
 streamlit run manage_questions.py
 ```
 
-Depois de editar o banco, faça upload do CSV para o Google Drive (ou use o CSV local) e rode o web app em ambiente local ou em produção. Obs.: o CSV do Drive é cacheado por 24 horas (para aplicar um CSV novo antes disso, use *Reboot app* no painel do Streamlit); recarregue (F5) para reiniciar o simulado.
+Depois de editar o banco, faça upload do CSV para o Google Drive (ou use o CSV local) e rode o web app em ambiente local ou em produção. Obs.: o CSV do Drive é cacheado por 24 horas no servidor e no aparelho do aluno (para aplicar um CSV novo antes disso, use *Reboot app* no painel do Streamlit: o servidor busca a versão nova; quem já tinha a anterior guardada no aparelho ainda a vê na primeira visita depois disso, e o aparelho é atualizado nessa mesma visita); recarregue (F5) para reiniciar o simulado.
 
 Material não oficial, criado para estudo a partir do guia oficial do exame e da documentação da AWS.
 
