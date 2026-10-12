@@ -324,7 +324,9 @@ if not st.session_state.started:
     st.button("Iniciar Simulado", on_click=start_simulado)
     ORIGENS = {"dispositivo": "do cache do seu dispositivo", "servidor": "do cache do servidor",
                "drive": "do Google Drive", "csv local": "do CSV local"}
-    st.caption(f"⚡ Perguntas carregadas {ORIGENS.get(FONTE, '')}.")
+    # Só depois que o aparelho responde (até ~1 s): antes disso a origem final ainda não está decidida
+    if dispositivo().get("reported") or time.time() - st.session_state.t_abertura >= DEVICE_GRACE:
+        st.caption(f"⚡ Perguntas carregadas {ORIGENS.get(FONTE, '')}.")
     st.stop()
 
 
